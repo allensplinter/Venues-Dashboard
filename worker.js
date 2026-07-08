@@ -217,61 +217,12 @@ async function squareLocations(env) {
 /* Count COMPLETED orders (voids/cancelled excluded by the state filter; refunds
    are separate records and never reduce the count) across the account's active
    locations, by closed_at within [startISO, endISO). */
-/* Brief per-isolate memo so the count and the (deviation) revenue adapter don't
-   double-hit Square for the same window. */
-const squareMemo = new Map();
+/* ---- Square -> KV month-store (bulk fetch, few writes, fast reads) ---- */
 
-/* One pass over COMPLETED Square orders in [startISO,endISO): returns the
-   transaction COUNT and the gross TAKINGS in dollars (total_money less tips;
-   INCLUDES GST). Voids/cancelled excluded by the state filter; refunds are
-   separate records and never reduce either figure. */
-async function squareSummary(env, startISO, endISO) {
-  const key = startISO + '|' + endISO;
-  const hit = squareMemo.get(key);
-  if (hit && (Date.now() - hit.t) < 60000) return hit.v;
-  const locs = await squareLocations(env);
-  const ids = locs.filter((l) => (l.status || 'ACTIVE') === 'ACTIVE').map((l) => l.id).slice(0, 10);
-  if (!ids.length) { const v = { count: 0, takings: 0 }; squareMemo.set(key, { t: Date.now(), v: v }); return v; }
-  let count = 0, takingsCents = 0, cursor, pages = 0;
-  do {
-    const body = {
-      location_ids: ids,
-      limit: 500,
-      query: {
-        filter: {
-          state_filter: { states: ['COMPLETED'] },
-          date_time_filter: { closed_at: { start_at: startISO, end_at: endISO } }
-        },
-        sort: { sort_field: 'CLOSED_AT', sort_order: 'ASC' }
-      }
-    };
-    if (cursor) body.cursor = cursor;
-    const r = await fetch(SQUARE_HOST + '/v2/orders/search', {
-      method: 'POST',
-      headers: {
-        'Square-Version': SQUARE_VERSION,
-        'Authorization': 'Bearer ' + (env.POS_API_TOKEN || ''),
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(body)
-    });
-    if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
-    const j = await r.json();
-    for (const o of (j.orders || [])) {
-      count++;
-      const total = (o.total_money && o.total_money.amount) || 0;
-      const tip = (o.total_tip_money && o.total_tip_money.amount) || 0;
-      takingsCents += (total - tip);
-    }
-    cursor = j.cursor;
-    pages++;
-  } while (cursor && pages < 100);
-  const v = { count: count, takings: takingsCents / 100 };
-  squareMemo.set(key, { t: Date.now(), v: v });
-  return v;
+function localDateInTz(iso, tz) {
+  const dtf = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
+  return dtf.format(new Date(iso));
 }
-
-/* ---- Square -> KV day-store (fast reads; keeps page loads within limits) ---- */
 
 async function squareLocationTz(env) {
   const locs = await squareLocations(env);
@@ -279,80 +230,119 @@ async function squareLocationTz(env) {
   return (active[0] && active[0].timezone) || (locs[0] && locs[0].timezone) || 'Australia/Sydney';
 }
 
-async function storeSquareDay(env, dateStr, count, takings) {
-  await env.TOKENS.put('data:pos:' + dateStr, JSON.stringify({ count: count }));
-  await env.TOKENS.put('data:accounting:' + dateStr, JSON.stringify({ revenue: takings }));
+/* One bulk paginated pull of COMPLETED orders across [from,to] (venue-tz calendar
+   days), bucketed by local day. Voids/cancelled excluded by the state filter;
+   refunds are separate records and never reduce the figures. Takings = total_money
+   less tips (still INCLUDES GST - deviation, by owner's choice). Returns
+   Map(YYYY-MM-DD -> { count, takings }). */
+async function squareRangeByDay(env, from, to, tz) {
+  const startISO = zonedInstantISO(from, 0, tz);
+  const endISO = zonedInstantISO(addDays(to, 1), 0, tz);
+  const locs = await squareLocations(env);
+  const ids = locs.filter((l) => (l.status || 'ACTIVE') === 'ACTIVE').map((l) => l.id).slice(0, 10);
+  const byDay = new Map();
+  if (!ids.length) return byDay;
+  let cursor, pages = 0;
+  do {
+    const body = {
+      location_ids: ids, limit: 500,
+      query: {
+        filter: { state_filter: { states: ['COMPLETED'] }, date_time_filter: { closed_at: { start_at: startISO, end_at: endISO } } },
+        sort: { sort_field: 'CLOSED_AT', sort_order: 'ASC' }
+      }
+    };
+    if (cursor) body.cursor = cursor;
+    const r = await fetch(SQUARE_HOST + '/v2/orders/search', {
+      method: 'POST',
+      headers: { 'Square-Version': SQUARE_VERSION, 'Authorization': 'Bearer ' + (env.POS_API_TOKEN || ''), 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
+    const j = await r.json();
+    for (const o of (j.orders || [])) {
+      const when = o.closed_at || o.created_at;
+      if (!when) continue;
+      const ds = localDateInTz(when, tz);
+      const cur = byDay.get(ds) || { count: 0, takings: 0 };
+      cur.count += 1;
+      const total = (o.total_money && o.total_money.amount) || 0;
+      const tip = (o.total_tip_money && o.total_tip_money.amount) || 0;
+      cur.takings += (total - tip) / 100;
+      byDay.set(ds, cur);
+    }
+    cursor = j.cursor; pages++;
+  } while (cursor && pages < 48);
+  return byDay;
 }
 
-async function rollupMonth(env, mo) {
-  const [y, m] = mo.split('-').map(Number);
-  const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
-  let count = 0, revenue = 0, days = 0;
-  for (let d = 1; d <= lastDay; d++) {
-    const ds = mo + '-' + String(d).padStart(2, '0');
-    const rawP = await env.TOKENS.get('data:pos:' + ds);
-    if (rawP) { days++; try { count += (JSON.parse(rawP).count) || 0; } catch (e) {} }
-    const rawA = await env.TOKENS.get('data:accounting:' + ds);
-    if (rawA) { try { revenue += (JSON.parse(rawA).revenue) || 0; } catch (e) {} }
-  }
-  await env.TOKENS.put('roll:pos:' + mo, JSON.stringify({ count: count, days: days }));
-  await env.TOKENS.put('roll:accounting:' + mo, JSON.stringify({ revenue: revenue, days: days }));
-}
-
-/* Calendar-day buckets in the venue's own timezone (matches Square reporting). */
-async function syncSquareDates(env, dates) {
-  if (!env.POS_API_TOKEN || !dates.length) return 0;
+/* Persist [from,to]: per touched month write a compact day-map (pos=counts,
+   accounting=revenue) plus a month rollup. Zero-fills days inside the range so
+   coverage is explicit; merges with any existing day-map so a partial re-sync
+   never wipes other days. A handful of KV writes per month (not per day). */
+async function syncSquareRange(env, from, to) {
+  if (!env.POS_API_TOKEN) return { days: 0, months: 0 };
   const tz = await squareLocationTz(env);
   try {
     const locs = await squareLocations(env);
-    const active = locs.filter((l) => (l.status || 'ACTIVE') === 'ACTIVE');
-    const org = (active[0] && (active[0].business_name || active[0].name)) || (locs[0] && (locs[0].business_name || locs[0].name));
+    const a = locs.filter((l) => (l.status || 'ACTIVE') === 'ACTIVE');
+    const org = (a[0] && (a[0].business_name || a[0].name)) || (locs[0] && (locs[0].business_name || locs[0].name));
     if (org) await env.TOKENS.put('sys:sq_org', org);
   } catch (e) {}
-  const touched = new Set();
-  let done = 0;
-  for (const ds of dates) {
-    const startISO = zonedInstantISO(ds, 0, tz);
-    const endISO = zonedInstantISO(addDays(ds, 1), 0, tz);
-    const s = await squareSummary(env, startISO, endISO);
-    await storeSquareDay(env, ds, s.count, s.takings);
-    touched.add(ds.slice(0, 7));
-    done++;
+  const byDay = await squareRangeByDay(env, from, to, tz);
+  const months = new Set();
+  for (const ds of eachDate(from, to, 800)) months.add(ds.slice(0, 7));
+  for (const mo of months) {
+    let dc = {}, dr = {};
+    const ec = await env.TOKENS.get('daymap:pos:' + mo); if (ec) { try { dc = JSON.parse(ec); } catch (e) {} }
+    const er = await env.TOKENS.get('daymap:accounting:' + mo); if (er) { try { dr = JSON.parse(er); } catch (e) {} }
+    const [y, m] = mo.split('-').map(Number);
+    const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+    for (let d = 1; d <= lastDay; d++) {
+      const ds = mo + '-' + String(d).padStart(2, '0');
+      if (ds < from || ds > to) continue;
+      const v = byDay.get(ds) || { count: 0, takings: 0 };
+      dc[ds] = v.count; dr[ds] = Math.round(v.takings * 100) / 100;
+    }
+    let count = 0, rev = 0, days = 0;
+    for (const key in dc) { count += dc[key]; days++; }
+    for (const key in dr) { rev += dr[key]; }
+    await env.TOKENS.put('daymap:pos:' + mo, JSON.stringify(dc));
+    await env.TOKENS.put('daymap:accounting:' + mo, JSON.stringify(dr));
+    await env.TOKENS.put('roll:pos:' + mo, JSON.stringify({ count: count, days: days }));
+    await env.TOKENS.put('roll:accounting:' + mo, JSON.stringify({ revenue: Math.round(rev * 100) / 100, days: days }));
   }
-  for (const mo of touched) await rollupMonth(env, mo);
   await noteSync(env, 'pos');
   await noteSync(env, 'accounting');
-  return done;
+  return { days: eachDate(from, to, 800).length, months: months.size };
 }
 
 const SYNC_TREND_MONTHS = 25;
-const SYNC_REFRESH_DAYS = 3;
-const SYNC_BACKFILL_CHUNK = 20;
+const SYNC_RECENT_DAYS = 35;
+const SYNC_BACKFILL_DAYS = 185;   /* ~6 months of history per pass, one bulk pull */
 
-function recentDates(days) {
-  const today = new Date().toISOString().slice(0, 10);
-  const out = [];
-  for (let i = 0; i < days; i++) out.push(addDays(today, -i));
-  return out;
-}
+function todayISO() { return new Date().toISOString().slice(0, 10); }
 
-async function squareSyncPass(env, manualChunk) {
-  const refreshed = await syncSquareDates(env, recentDates(SYNC_REFRESH_DAYS));
-  const today = new Date().toISOString().slice(0, 10);
+async function squareSyncPass(env, range) {
+  if (range && range.from && range.to) {
+    const res = await syncSquareRange(env, range.from, range.to);
+    return { manual: true, from: range.from, to: range.to, months: res.months, days: res.days };
+  }
+  const today = todayISO();
+  await syncSquareRange(env, addDays(today, -(SYNC_RECENT_DAYS - 1)), today);
   const target = addDays(today, -Math.round(SYNC_TREND_MONTHS * 30.5));
   let cursor = await env.TOKENS.get('sys:sq_backfill');
-  const earliestRecent = addDays(today, -(SYNC_REFRESH_DAYS - 1));
+  const earliestRecent = addDays(today, -(SYNC_RECENT_DAYS - 1));
   if (!cursor || cursor > earliestRecent) cursor = earliestRecent;
-  const chunk = manualChunk || SYNC_BACKFILL_CHUNK;
-  const dates = [];
-  let d = addDays(cursor, -1);
-  while (dates.length < chunk && d >= target) { dates.push(d); d = addDays(d, -1); }
-  let backfilled = 0;
-  if (dates.length) {
-    backfilled = await syncSquareDates(env, dates);
-    await env.TOKENS.put('sys:sq_backfill', dates[dates.length - 1]);
+  let backfilledDays = 0, oldest = cursor, complete = true;
+  if (cursor > target) {
+    const to = addDays(cursor, -1);
+    const from = (addDays(cursor, -SYNC_BACKFILL_DAYS) < target) ? target : addDays(cursor, -SYNC_BACKFILL_DAYS);
+    const res = await syncSquareRange(env, from, to);
+    backfilledDays = res.days; oldest = from;
+    await env.TOKENS.put('sys:sq_backfill', from);
+    complete = (from <= target);
   }
-  return { refreshed: refreshed, backfilled: backfilled, oldestSynced: dates.length ? dates[dates.length - 1] : cursor, target: target, complete: !(d >= target) };
+  return { refreshedDays: SYNC_RECENT_DAYS, backfilledDays: backfilledDays, oldest: oldest, target: target, complete: complete };
 }
 
 async function sumRangeField(env, source, from, to, field) {
@@ -369,16 +359,12 @@ async function sumRangeField(env, source, from, to, field) {
       cur = addDays(monthLast, 1);
     } else {
       const stop = (to < monthLast) ? to : monthLast;
-      let d = cur;
-      while (d <= stop) {
-        const raw = await env.TOKENS.get('data:' + source + ':' + d);
-        if (raw) { try { const r = JSON.parse(raw); if (typeof r[field] === 'number') { sum += r[field]; hasData = true; } } catch (e) {} }
-        d = addDays(d, 1);
-      }
+      const raw = await env.TOKENS.get('daymap:' + source + ':' + mo);
+      if (raw) { try { const map = JSON.parse(raw); let d = cur; while (d <= stop) { if (typeof map[d] === 'number') { sum += map[d]; hasData = true; } d = addDays(d, 1); } } catch (e) {} }
       cur = addDays(stop, 1);
     }
   }
-  return { sum: sum, hasData: hasData };
+  return { sum: Math.round(sum * 100) / 100, hasData: hasData };
 }
 
 async function monthSeriesField(env, source, fromMonth, toMonth, field) {
@@ -1016,8 +1002,9 @@ export default {
     }
     if (path === '/api/pos-sync' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
-      const chunk = Math.min(40, Math.max(0, parseInt(url.searchParams.get('chunk') || '0', 10) || 0));
-      try { const res = await squareSyncPass(env, chunk || undefined); return json(Object.assign({ ok: true }, res)); }
+      const from = url.searchParams.get('from'), to = url.searchParams.get('to');
+      const range = (/^\d{4}-\d{2}-\d{2}$/.test(from || '') && /^\d{4}-\d{2}-\d{2}$/.test(to || '')) ? { from: from, to: to } : null;
+      try { const res = await squareSyncPass(env, range); return json(Object.assign({ ok: true }, res)); }
       catch (e) { return json({ ok: false, error: (e && e.message) || 'sync failed' }, 500); }
     }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
