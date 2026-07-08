@@ -318,7 +318,7 @@ async function syncSquareRange(env, from, to) {
 
 const SYNC_TREND_MONTHS = 25;
 const SYNC_RECENT_DAYS = 35;
-const SYNC_BACKFILL_DAYS = 185;   /* ~6 months of history per pass, one bulk pull */
+const SYNC_BACKFILL_DAYS = 40;   /* ~40 days per pass - stays under free-plan CPU/subrequest limits */
 
 function todayISO() { return new Date().toISOString().slice(0, 10); }
 
