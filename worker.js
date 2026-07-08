@@ -99,23 +99,13 @@ const ADAPTERS = {
       return { connected: true, org: name + ' — Square takings (incl. GST, not P&L-reconciled)', sandbox: false };
     },
     async fetchRange(env, h, q) {
-      const startISO = zonedInstantISO(q.from, q.rollover || 0, q.tz);
-      const endISO = zonedInstantISO(addDays(q.to, 1), q.rollover || 0, q.tz);
-      const s = await squareSummary(env, startISO, endISO);
-      return { revenue: s.takings, cogs: null, wagesSuper: null, overheads: null };
+      const r = await sumRangeField(env, 'accounting', q.from, q.to, 'revenue');
+      return { revenue: r.hasData ? r.sum : null, cogs: null, wagesSuper: null, overheads: null };
     },
     async fetchMonthly(env, h, q) {
-      const months = monthList(q.fromMonth, q.toMonth);
-      const revenue = [];
-      for (const mo of months) {
-        const [y, m] = mo.split('-').map(Number);
-        const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
-        const startISO = zonedInstantISO(mo + '-01', q.rollover || 0, q.tz);
-        const endISO = zonedInstantISO(addDays(mo + '-' + String(lastDay).padStart(2, '0'), 1), q.rollover || 0, q.tz);
-        revenue.push((await squareSummary(env, startISO, endISO)).takings);
-      }
-      const nulls = months.map(() => null);
-      return { months: months, revenue: revenue, cogs: nulls, wagesSuper: nulls, overheads: nulls };
+      const s = await monthSeriesField(env, 'accounting', q.fromMonth, q.toMonth, 'revenue');
+      const nulls = s.months.map(() => null);
+      return { months: s.months, revenue: s.arr, cogs: nulls, wagesSuper: nulls, overheads: nulls };
     }
   },
 
@@ -149,21 +139,12 @@ const ADAPTERS = {
       return { connected: true, org: org, sandbox: false };
     },
     async fetchRange(env, h, q) {
-      const startISO = zonedInstantISO(q.from, q.rollover || 0, q.tz);
-      const endISO = zonedInstantISO(addDays(q.to, 1), q.rollover || 0, q.tz);
-      return { count: (await squareSummary(env, startISO, endISO)).count };
+      const r = await sumRangeField(env, 'pos', q.from, q.to, 'count');
+      return { count: r.hasData ? r.sum : null };
     },
     async fetchMonthly(env, h, q) {
-      const months = monthList(q.fromMonth, q.toMonth);
-      const count = [];
-      for (const mo of months) {
-        const [y, m] = mo.split('-').map(Number);
-        const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
-        const startISO = zonedInstantISO(mo + '-01', q.rollover || 0, q.tz);
-        const endISO = zonedInstantISO(addDays(mo + '-' + String(lastDay).padStart(2, '0'), 1), q.rollover || 0, q.tz);
-        count.push((await squareSummary(env, startISO, endISO)).count);
-      }
-      return { months: months, count: count };
+      const s = await monthSeriesField(env, 'pos', q.fromMonth, q.toMonth, 'count');
+      return { months: s.months, count: s.arr };
     }
   },
 
@@ -224,7 +205,9 @@ function addDays(dateStr, n) {
 const SQUARE_HOST = 'https://connect.squareup.com';
 const SQUARE_VERSION = '2026-05-20';
 
+let squareLocCache = null;
 async function squareLocations(env) {
+  if (squareLocCache && (Date.now() - squareLocCache.t) < 300000) return squareLocCache.v;
   const r = await fetch(SQUARE_HOST + '/v2/locations', {
     headers: {
       'Square-Version': SQUARE_VERSION,
@@ -234,7 +217,9 @@ async function squareLocations(env) {
   });
   if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
   const j = await r.json();
-  return j.locations || [];
+  const v = j.locations || [];
+  squareLocCache = { t: Date.now(), v: v };
+  return v;
 }
 
 /* Count COMPLETED orders (voids/cancelled excluded by the state filter; refunds
@@ -292,6 +277,121 @@ async function squareSummary(env, startISO, endISO) {
   const v = { count: count, takings: takingsCents / 100 };
   squareMemo.set(key, { t: Date.now(), v: v });
   return v;
+}
+
+/* ---- Square -> KV day-store (fast reads; keeps page loads within limits) ---- */
+
+async function squareLocationTz(env) {
+  const locs = await squareLocations(env);
+  const active = locs.filter((l) => (l.status || 'ACTIVE') === 'ACTIVE');
+  return (active[0] && active[0].timezone) || (locs[0] && locs[0].timezone) || 'Australia/Sydney';
+}
+
+async function storeSquareDay(env, dateStr, count, takings) {
+  await env.TOKENS.put('data:pos:' + dateStr, JSON.stringify({ count: count }));
+  await env.TOKENS.put('data:accounting:' + dateStr, JSON.stringify({ revenue: takings }));
+}
+
+async function rollupMonth(env, mo) {
+  const [y, m] = mo.split('-').map(Number);
+  const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  let count = 0, revenue = 0, days = 0;
+  for (let d = 1; d <= lastDay; d++) {
+    const ds = mo + '-' + String(d).padStart(2, '0');
+    const rawP = await env.TOKENS.get('data:pos:' + ds);
+    if (rawP) { days++; try { count += (JSON.parse(rawP).count) || 0; } catch (e) {} }
+    const rawA = await env.TOKENS.get('data:accounting:' + ds);
+    if (rawA) { try { revenue += (JSON.parse(rawA).revenue) || 0; } catch (e) {} }
+  }
+  await env.TOKENS.put('roll:pos:' + mo, JSON.stringify({ count: count, days: days }));
+  await env.TOKENS.put('roll:accounting:' + mo, JSON.stringify({ revenue: revenue, days: days }));
+}
+
+/* Calendar-day buckets in the venue's own timezone (matches Square reporting). */
+async function syncSquareDates(env, dates) {
+  if (!env.POS_API_TOKEN || !dates.length) return 0;
+  const tz = await squareLocationTz(env);
+  const touched = new Set();
+  let done = 0;
+  for (const ds of dates) {
+    const startISO = zonedInstantISO(ds, 0, tz);
+    const endISO = zonedInstantISO(addDays(ds, 1), 0, tz);
+    const s = await squareSummary(env, startISO, endISO);
+    await storeSquareDay(env, ds, s.count, s.takings);
+    touched.add(ds.slice(0, 7));
+    done++;
+  }
+  for (const mo of touched) await rollupMonth(env, mo);
+  await noteSync(env, 'pos');
+  await noteSync(env, 'accounting');
+  return done;
+}
+
+const SYNC_TREND_MONTHS = 25;
+const SYNC_REFRESH_DAYS = 3;
+const SYNC_BACKFILL_CHUNK = 20;
+
+function recentDates(days) {
+  const today = new Date().toISOString().slice(0, 10);
+  const out = [];
+  for (let i = 0; i < days; i++) out.push(addDays(today, -i));
+  return out;
+}
+
+async function squareSyncPass(env, manualChunk) {
+  const refreshed = await syncSquareDates(env, recentDates(SYNC_REFRESH_DAYS));
+  const today = new Date().toISOString().slice(0, 10);
+  const target = addDays(today, -Math.round(SYNC_TREND_MONTHS * 30.5));
+  let cursor = await env.TOKENS.get('sys:sq_backfill');
+  const earliestRecent = addDays(today, -(SYNC_REFRESH_DAYS - 1));
+  if (!cursor || cursor > earliestRecent) cursor = earliestRecent;
+  const chunk = manualChunk || SYNC_BACKFILL_CHUNK;
+  const dates = [];
+  let d = addDays(cursor, -1);
+  while (dates.length < chunk && d >= target) { dates.push(d); d = addDays(d, -1); }
+  let backfilled = 0;
+  if (dates.length) {
+    backfilled = await syncSquareDates(env, dates);
+    await env.TOKENS.put('sys:sq_backfill', dates[dates.length - 1]);
+  }
+  return { refreshed: refreshed, backfilled: backfilled, oldestSynced: dates.length ? dates[dates.length - 1] : cursor, target: target, complete: !(d >= target) };
+}
+
+async function sumRangeField(env, source, from, to, field) {
+  let sum = 0, hasData = false, cur = from;
+  while (cur <= to) {
+    const mo = cur.slice(0, 7);
+    const [y, m] = mo.split('-').map(Number);
+    const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+    const monthFirst = mo + '-01';
+    const monthLast = mo + '-' + String(lastDay).padStart(2, '0');
+    if (cur === monthFirst && to >= monthLast) {
+      const raw = await env.TOKENS.get('roll:' + source + ':' + mo);
+      if (raw) { try { const r = JSON.parse(raw); if (typeof r[field] === 'number' && r.days) { sum += r[field]; hasData = true; } } catch (e) {} }
+      cur = addDays(monthLast, 1);
+    } else {
+      const stop = (to < monthLast) ? to : monthLast;
+      let d = cur;
+      while (d <= stop) {
+        const raw = await env.TOKENS.get('data:' + source + ':' + d);
+        if (raw) { try { const r = JSON.parse(raw); if (typeof r[field] === 'number') { sum += r[field]; hasData = true; } } catch (e) {} }
+        d = addDays(d, 1);
+      }
+      cur = addDays(stop, 1);
+    }
+  }
+  return { sum: sum, hasData: hasData };
+}
+
+async function monthSeriesField(env, source, fromMonth, toMonth, field) {
+  const months = monthList(fromMonth, toMonth);
+  const arr = [];
+  for (const mo of months) {
+    const raw = await env.TOKENS.get('roll:' + source + ':' + mo);
+    if (raw) { try { const r = JSON.parse(raw); arr.push((typeof r[field] === 'number' && r.days) ? r[field] : null); } catch (e) { arr.push(null); } }
+    else arr.push(null);
+  }
+  return { months: months, arr: arr };
 }
 
 class NotConfigured extends Error {
@@ -908,6 +1008,12 @@ export default {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       return apiMetrics(env, url);
     }
+    if (path === '/api/pos-sync' && request.method === 'GET') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      const chunk = Math.min(40, Math.max(0, parseInt(url.searchParams.get('chunk') || '0', 10) || 0));
+      try { const res = await squareSyncPass(env, chunk || undefined); return json(Object.assign({ ok: true }, res)); }
+      catch (e) { return json({ ok: false, error: (e && e.message) || 'sync failed' }, 500); }
+    }
     const authRoute = /^\/auth\/(accounting|pos|rostering)\/(start|callback)$/.exec(path);
     if (authRoute && request.method === 'GET') {
       if (!loggedIn) return Response.redirect(url.origin + '/', 302);
@@ -928,6 +1034,7 @@ export default {
   /* Cron rung: uncomment [triggers] in wrangler.toml and give any adapter a
      scheduledPull() to fetch its tool's own export on a schedule. */
   async scheduled(event, env, ctx) {
+    try { await squareSyncPass(env); } catch (e) { console.log('square sync failed: ' + (e && e.message)); }
     for (const source of ['accounting', 'pos', 'rostering']) {
       const a = ADAPTERS[source];
       if (a && typeof a.scheduledPull === 'function') {
