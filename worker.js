@@ -79,22 +79,44 @@ const ADAPTERS = {
      'Demo Company'. Secrets: ACCOUNTING_CLIENT_ID, ACCOUNTING_CLIENT_SECRET.
   */
   accounting: {
-    configured: false,
-    auth: null, /* 'oauth' | 'token' */
-    oauth: {
-      /* Example (Xero) - fill these when you wire the adapter:
-         authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
-         tokenUrl: 'https://identity.xero.com/connect/token',
-         scopes: 'offline_access accounting.reports.profitandloss.read',
-         clientIdSecret: 'ACCOUNTING_CLIENT_ID',
-         clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
-         tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth
-                              // (client_secret_basic). Use 'post' only for providers
-                              // that expect client_id/secret in the form body. */
+    /* DEVIATION from the kit (owner's explicit choice, CLAUDE.md rule 3):
+       Revenue is sourced from SQUARE POS TAKINGS (INCLUDES GST; excludes any
+       non-till channel such as invoiced functions or delivery), NOT from an
+       MYOB ex-GST P&L. Cost lines (cogs/wages/overheads) stay null until MYOB
+       is connected, so COGS%/Wage%/Overheads/Profit honestly show 'not
+       configured'. These figures cannot reconcile to a P&L and are left
+       UNVERIFIED by design. Secret: POS_API_TOKEN (the same Square token).
+       When MYOB developer access is approved, revisit this with the owner. */
+    configured: true,
+    auth: 'token',
+    oauth: {},
+    async status(env, h) {
+      if (!env.POS_API_TOKEN) return { connected: false };
+      const locs = await squareLocations(env);
+      const active = locs.filter((l) => (l.status || 'ACTIVE') === 'ACTIVE');
+      const name = (active[0] && (active[0].business_name || active[0].name))
+        || (locs[0] && (locs[0].business_name || locs[0].name)) || 'Square';
+      return { connected: true, org: name + ' — Square takings (incl. GST, not P&L-reconciled)', sandbox: false };
     },
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('accounting'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('accounting'); }
+    async fetchRange(env, h, q) {
+      const startISO = zonedInstantISO(q.from, q.rollover || 0, q.tz);
+      const endISO = zonedInstantISO(addDays(q.to, 1), q.rollover || 0, q.tz);
+      const s = await squareSummary(env, startISO, endISO);
+      return { revenue: s.takings, cogs: null, wagesSuper: null, overheads: null };
+    },
+    async fetchMonthly(env, h, q) {
+      const months = monthList(q.fromMonth, q.toMonth);
+      const revenue = [];
+      for (const mo of months) {
+        const [y, m] = mo.split('-').map(Number);
+        const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+        const startISO = zonedInstantISO(mo + '-01', q.rollover || 0, q.tz);
+        const endISO = zonedInstantISO(addDays(mo + '-' + String(lastDay).padStart(2, '0'), 1), q.rollover || 0, q.tz);
+        revenue.push((await squareSummary(env, startISO, endISO)).takings);
+      }
+      const nulls = months.map(() => null);
+      return { months: months, revenue: revenue, cogs: nulls, wagesSuper: nulls, overheads: nulls };
+    }
   },
 
   /* >>> ADAPTER 2: POS
@@ -129,7 +151,7 @@ const ADAPTERS = {
     async fetchRange(env, h, q) {
       const startISO = zonedInstantISO(q.from, q.rollover || 0, q.tz);
       const endISO = zonedInstantISO(addDays(q.to, 1), q.rollover || 0, q.tz);
-      return { count: await squareCount(env, startISO, endISO) };
+      return { count: (await squareSummary(env, startISO, endISO)).count };
     },
     async fetchMonthly(env, h, q) {
       const months = monthList(q.fromMonth, q.toMonth);
@@ -139,7 +161,7 @@ const ADAPTERS = {
         const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
         const startISO = zonedInstantISO(mo + '-01', q.rollover || 0, q.tz);
         const endISO = zonedInstantISO(addDays(mo + '-' + String(lastDay).padStart(2, '0'), 1), q.rollover || 0, q.tz);
-        count.push(await squareCount(env, startISO, endISO));
+        count.push((await squareSummary(env, startISO, endISO)).count);
       }
       return { months: months, count: count };
     }
@@ -218,15 +240,25 @@ async function squareLocations(env) {
 /* Count COMPLETED orders (voids/cancelled excluded by the state filter; refunds
    are separate records and never reduce the count) across the account's active
    locations, by closed_at within [startISO, endISO). */
-async function squareCount(env, startISO, endISO) {
+/* Brief per-isolate memo so the count and the (deviation) revenue adapter don't
+   double-hit Square for the same window. */
+const squareMemo = new Map();
+
+/* One pass over COMPLETED Square orders in [startISO,endISO): returns the
+   transaction COUNT and the gross TAKINGS in dollars (total_money less tips;
+   INCLUDES GST). Voids/cancelled excluded by the state filter; refunds are
+   separate records and never reduce either figure. */
+async function squareSummary(env, startISO, endISO) {
+  const key = startISO + '|' + endISO;
+  const hit = squareMemo.get(key);
+  if (hit && (Date.now() - hit.t) < 60000) return hit.v;
   const locs = await squareLocations(env);
   const ids = locs.filter((l) => (l.status || 'ACTIVE') === 'ACTIVE').map((l) => l.id).slice(0, 10);
-  if (!ids.length) return 0;
-  let count = 0, cursor, pages = 0;
+  if (!ids.length) { const v = { count: 0, takings: 0 }; squareMemo.set(key, { t: Date.now(), v: v }); return v; }
+  let count = 0, takingsCents = 0, cursor, pages = 0;
   do {
     const body = {
       location_ids: ids,
-      return_entries: true,
       limit: 500,
       query: {
         filter: {
@@ -248,11 +280,18 @@ async function squareCount(env, startISO, endISO) {
     });
     if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
     const j = await r.json();
-    count += (j.order_entries || []).length;
+    for (const o of (j.orders || [])) {
+      count++;
+      const total = (o.total_money && o.total_money.amount) || 0;
+      const tip = (o.total_tip_money && o.total_tip_money.amount) || 0;
+      takingsCents += (total - tip);
+    }
     cursor = j.cursor;
     pages++;
-  } while (cursor && pages < 80);
-  return count;
+  } while (cursor && pages < 100);
+  const v = { count: count, takings: takingsCents / 100 };
+  squareMemo.set(key, { t: Date.now(), v: v });
+  return v;
 }
 
 class NotConfigured extends Error {
