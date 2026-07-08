@@ -92,10 +92,7 @@ const ADAPTERS = {
     oauth: {},
     async status(env, h) {
       if (!env.POS_API_TOKEN) return { connected: false };
-      const locs = await squareLocations(env);
-      const active = locs.filter((l) => (l.status || 'ACTIVE') === 'ACTIVE');
-      const name = (active[0] && (active[0].business_name || active[0].name))
-        || (locs[0] && (locs[0].business_name || locs[0].name)) || 'Square';
+      const name = (await env.TOKENS.get('sys:sq_org')) || 'Square';
       return { connected: true, org: name + ' — Square takings (incl. GST, not P&L-reconciled)', sandbox: false };
     },
     async fetchRange(env, h, q) {
@@ -130,12 +127,7 @@ const ADAPTERS = {
     oauth: {},
     async status(env, h) {
       if (!env.POS_API_TOKEN) return { connected: false };
-      const locs = await squareLocations(env);
-      const active = locs.filter((l) => (l.status || 'ACTIVE') === 'ACTIVE');
-      const org = (active[0] && (active[0].business_name || active[0].name))
-        || (locs[0] && (locs[0].business_name || locs[0].name)) || '';
-      /* We only ever call the PRODUCTION host; a sandbox token 401s here, so a
-         connected status means real data. */
+      const org = (await env.TOKENS.get('sys:sq_org')) || 'Square';
       return { connected: true, org: org, sandbox: false };
     },
     async fetchRange(env, h, q) {
@@ -311,6 +303,12 @@ async function rollupMonth(env, mo) {
 async function syncSquareDates(env, dates) {
   if (!env.POS_API_TOKEN || !dates.length) return 0;
   const tz = await squareLocationTz(env);
+  try {
+    const locs = await squareLocations(env);
+    const active = locs.filter((l) => (l.status || 'ACTIVE') === 'ACTIVE');
+    const org = (active[0] && (active[0].business_name || active[0].name)) || (locs[0] && (locs[0].business_name || locs[0].name));
+    if (org) await env.TOKENS.put('sys:sq_org', org);
+  } catch (e) {}
   const touched = new Set();
   let done = 0;
   for (const ds of dates) {
@@ -886,7 +884,7 @@ async function fetchSlot(env, q) {
   return out;
 }
 
-const METRICS_CACHE_TTL = 120; /* seconds: brief cache for live provider data */
+const METRICS_CACHE_TTL = 1800; /* seconds: brief cache for live provider data */
 
 async function apiMetrics(env, url) {
   const cur = parseRange(url.searchParams.get('cur'));
@@ -928,15 +926,23 @@ async function apiMetrics(env, url) {
 
     let trendOut = null;
     if (trend) {
-      trendOut = { months: monthList(trend.fromMonth, trend.toMonth) };
-      for (const source of ['accounting', 'pos']) {
-        const adapter = ADAPTERS[source];
-        if (!adapter || !adapter.configured) { trendOut[source] = null; continue; }
-        try {
-          const h = makeHelpers(env, source);
-          const series = await adapter.fetchMonthly(env, h, { ...base, ...trend });
-          trendOut[source] = alignSeries(trendOut.months, series);
-        } catch (err) { trendOut[source] = null; }
+      const trendKey = 'trendcache:' + trend.fromMonth + ':' + trend.toMonth + '|' + tz + '|' + rollover;
+      let cachedTrend = null;
+      if (!force && env.TOKENS) { const ct = await env.TOKENS.get(trendKey); if (ct) { try { cachedTrend = JSON.parse(ct); } catch (e) {} } }
+      if (cachedTrend) {
+        trendOut = cachedTrend;
+      } else {
+        trendOut = { months: monthList(trend.fromMonth, trend.toMonth) };
+        for (const source of ['accounting', 'pos']) {
+          const adapter = ADAPTERS[source];
+          if (!adapter || !adapter.configured) { trendOut[source] = null; continue; }
+          try {
+            const h = makeHelpers(env, source);
+            const series = await adapter.fetchMonthly(env, h, { ...base, ...trend });
+            trendOut[source] = alignSeries(trendOut.months, series);
+          } catch (err) { trendOut[source] = null; }
+        }
+        if (env.TOKENS) { try { await env.TOKENS.put(trendKey, JSON.stringify(trendOut), { expirationTtl: 3600 }); } catch (e) {} }
       }
     }
     data = { generatedAt: new Date().toISOString(), periods: periods, trend: trendOut };
