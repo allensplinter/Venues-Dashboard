@@ -111,12 +111,38 @@ const ADAPTERS = {
      connect.squareupsandbox.com.
   */
   pos: {
-    configured: false,
-    auth: null,
+    /* Square POS - transaction COUNT only (never a dollar figure). Secret: POS_API_TOKEN
+       (production personal access token). See capability-matrix.md / Appendix B. */
+    configured: true,
+    auth: 'token',
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+    async status(env, h) {
+      if (!env.POS_API_TOKEN) return { connected: false };
+      const locs = await squareLocations(env);
+      const active = locs.filter((l) => (l.status || 'ACTIVE') === 'ACTIVE');
+      const org = (active[0] && (active[0].business_name || active[0].name))
+        || (locs[0] && (locs[0].business_name || locs[0].name)) || '';
+      /* We only ever call the PRODUCTION host; a sandbox token 401s here, so a
+         connected status means real data. */
+      return { connected: true, org: org, sandbox: false };
+    },
+    async fetchRange(env, h, q) {
+      const startISO = zonedInstantISO(q.from, q.rollover || 0, q.tz);
+      const endISO = zonedInstantISO(addDays(q.to, 1), q.rollover || 0, q.tz);
+      return { count: await squareCount(env, startISO, endISO) };
+    },
+    async fetchMonthly(env, h, q) {
+      const months = monthList(q.fromMonth, q.toMonth);
+      const count = [];
+      for (const mo of months) {
+        const [y, m] = mo.split('-').map(Number);
+        const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+        const startISO = zonedInstantISO(mo + '-01', q.rollover || 0, q.tz);
+        const endISO = zonedInstantISO(addDays(mo + '-' + String(lastDay).padStart(2, '0'), 1), q.rollover || 0, q.tz);
+        count.push(await squareCount(env, startISO, endISO));
+      }
+      return { months: months, count: count };
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
@@ -139,8 +165,95 @@ const ADAPTERS = {
 };
 
 /* ============================================================================
-   Everything below is the shell. You should rarely need to edit it.
+   Adapter helpers added for this build (timezone-correct ranges + Square POS).
+   Function declarations/consts here are only used at request time, so their
+   position in the file is fine.
 ============================================================================ */
+
+/* Minutes that `tz` is ahead of UTC at the given instant (handles DST). */
+function tzOffsetMinutes(tz, date) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, hourCycle: 'h23',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  });
+  const map = {};
+  for (const part of dtf.formatToParts(date)) map[part.type] = part.value;
+  const asUTC = Date.UTC(+map.year, +map.month - 1, +map.day, +map.hour, +map.minute, +map.second);
+  return Math.round((asUTC - date.getTime()) / 60000);
+}
+
+/* RFC3339 UTC instant for local wall-time <dateStr> at <hour>:00 in <tz>.
+   Used to turn a trading-day boundary (with rollover) into an absolute time. */
+function zonedInstantISO(dateStr, hour, tz) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const guess = Date.UTC(y, m - 1, d, hour, 0, 0);
+  const off = tzOffsetMinutes(tz, new Date(guess));
+  return new Date(guess - off * 60000).toISOString();
+}
+
+function addDays(dateStr, n) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + n);
+  return dt.toISOString().slice(0, 10);
+}
+
+const SQUARE_HOST = 'https://connect.squareup.com';
+const SQUARE_VERSION = '2026-05-20';
+
+async function squareLocations(env) {
+  const r = await fetch(SQUARE_HOST + '/v2/locations', {
+    headers: {
+      'Square-Version': SQUARE_VERSION,
+      'Authorization': 'Bearer ' + (env.POS_API_TOKEN || ''),
+      'Content-Type': 'application/json'
+    }
+  });
+  if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
+  const j = await r.json();
+  return j.locations || [];
+}
+
+/* Count COMPLETED orders (voids/cancelled excluded by the state filter; refunds
+   are separate records and never reduce the count) across the account's active
+   locations, by closed_at within [startISO, endISO). */
+async function squareCount(env, startISO, endISO) {
+  const locs = await squareLocations(env);
+  const ids = locs.filter((l) => (l.status || 'ACTIVE') === 'ACTIVE').map((l) => l.id).slice(0, 10);
+  if (!ids.length) return 0;
+  let count = 0, cursor, pages = 0;
+  do {
+    const body = {
+      location_ids: ids,
+      return_entries: true,
+      limit: 500,
+      query: {
+        filter: {
+          state_filter: { states: ['COMPLETED'] },
+          date_time_filter: { closed_at: { start_at: startISO, end_at: endISO } }
+        },
+        sort: { sort_field: 'CLOSED_AT', sort_order: 'ASC' }
+      }
+    };
+    if (cursor) body.cursor = cursor;
+    const r = await fetch(SQUARE_HOST + '/v2/orders/search', {
+      method: 'POST',
+      headers: {
+        'Square-Version': SQUARE_VERSION,
+        'Authorization': 'Bearer ' + (env.POS_API_TOKEN || ''),
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
+    const j = await r.json();
+    count += (j.order_entries || []).length;
+    cursor = j.cursor;
+    pages++;
+  } while (cursor && pages < 80);
+  return count;
+}
 
 class NotConfigured extends Error {
   constructor(source) { super('not configured: ' + source); this.source = source; }
